@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import get_settings
 from .db import init_db
 from .middleware import HTTPSRedirectGuard, RequestContextMiddleware, SecurityHeadersMiddleware
+from .openapi import app_metadata
 from .routers import auth, health, vault
 
 logging.basicConfig(
@@ -44,18 +45,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(
-        lifespan=lifespan,
-        title="zkvault blind sync",
-        version="1.0.0",
-        description=(
-            "Stores encrypted vault blobs. The server cannot decrypt them, cannot "
-            "search them, and offers no password recovery."
-        ),
-        docs_url=None if settings.is_production else "/docs",
-        redoc_url=None,
-        openapi_url=None if settings.is_production else "/openapi.json",
-    )
+    # Swagger UI, ReDoc and the schema itself are a development affordance:
+    # app_metadata returns them wired up outside production and switched off
+    # inside it, so the deployed service publishes no route map at all.
+    app = FastAPI(lifespan=lifespan, **app_metadata(settings))
 
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(RequestContextMiddleware)

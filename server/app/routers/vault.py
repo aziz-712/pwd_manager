@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import base64
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
 from .. import audit
@@ -17,7 +17,15 @@ from ..config import get_settings
 from ..db import get_db
 from ..deps import current_user, sync_rate_limit
 from ..models import AuditEvent, User, VaultBlob
-from ..schemas import AuditEventOut, VaultMetaOut, VaultOut, VaultPutIn
+from ..openapi import errors
+from ..schemas import (
+    AuditEventOut,
+    ConflictOut,
+    VaultDeleteOut,
+    VaultMetaOut,
+    VaultOut,
+    VaultPutIn,
+)
 
 router = APIRouter(prefix="/vault", tags=["vault"], dependencies=[Depends(sync_rate_limit)])
 
@@ -30,7 +38,12 @@ def _meta(blob: VaultBlob) -> dict:
     }
 
 
-@router.get("/meta", response_model=VaultMetaOut)
+@router.get(
+    "/meta",
+    response_model=VaultMetaOut,
+    summary="Current version and size",
+    responses=errors(401, 429),
+)
 def vault_meta(user: User = Depends(current_user), db: Session = Depends(get_db)) -> VaultMetaOut:
     """Cheap version probe, so a client can skip downloading an unchanged vault."""
     blob = db.get(VaultBlob, user.id)
@@ -39,7 +52,13 @@ def vault_meta(user: User = Depends(current_user), db: Session = Depends(get_db)
     return VaultMetaOut(**_meta(blob))
 
 
-@router.get("", response_model=VaultOut)
+@router.get(
+    "",
+    response_model=VaultOut,
+    summary="Download the encrypted vault",
+    description="Responds with an `ETag` carrying the version, so a conditional client can skip unchanged bodies.",
+    responses=errors(401, 404, 429, describe={404: "This account has never uploaded a vault."}),
+)
 def download(
     response: Response, user: User = Depends(current_user), db: Session = Depends(get_db)
 ) -> VaultOut:
@@ -50,12 +69,32 @@ def download(
     return VaultOut(blob=base64.b64encode(blob.blob).decode(), **_meta(blob))
 
 
-@router.put("", response_model=VaultMetaOut)
+@router.put(
+    "",
+    response_model=VaultMetaOut,
+    summary="Upload a new version",
+    responses=errors(
+        400,
+        401,
+        409,
+        413,
+        429,
+        models={409: ConflictOut},
+        describe={
+            400: "Empty blob, malformed If-Match, or If-Match disagreeing with base_version.",
+            409: "base_version is stale. Re-download, merge locally, and retry.",
+        },
+    ),
+)
 def upload(
     body: VaultPutIn,
     request: Request,
     response: Response,
-    if_match: str | None = Header(default=None, alias="If-Match"),
+    if_match: str | None = Header(
+        default=None,
+        alias="If-Match",
+        description='Optional belt and braces: the same number as `base_version`, quoted, e.g. `"3"`.',
+    ),
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> VaultMetaOut:
@@ -108,10 +147,16 @@ def upload(
     return VaultMetaOut(**_meta(blob))
 
 
-@router.delete("", status_code=200)
+@router.delete(
+    "",
+    status_code=200,
+    response_model=VaultDeleteOut,
+    summary="Delete the stored vault (irreversible)",
+    responses=errors(400, 401, 429, describe={400: "Missing ?confirm=DELETE."}),
+)
 def delete_vault(
     request: Request,
-    confirm: str = "",
+    confirm: str = Query(default="", description='Must be the literal string "DELETE".'),
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, bool]:
@@ -127,9 +172,16 @@ def delete_vault(
     return {"deleted": True}
 
 
-@router.get("/audit", response_model=list[AuditEventOut])
+@router.get(
+    "/audit",
+    response_model=list[AuditEventOut],
+    summary="Your own security events",
+    responses=errors(401, 429),
+)
 def my_audit_log(
-    limit: int = 50, user: User = Depends(current_user), db: Session = Depends(get_db)
+    limit: int = Query(default=50, description="Most recent events to return. Clamped to 1-200."),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
 ) -> list[AuditEventOut]:
     """A user's own security events -- logins, conflicts, MFA changes.
 

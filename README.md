@@ -14,7 +14,7 @@ zkvault/     Python client: crypto, vault format, CLI
 server/      FastAPI blind sync service
 kmp/         Kotlin Multiplatform client (skeleton)
 docs/        architecture, format spec, security checklist, roadmap
-tests/       75 tests, including tamper, fuzz, rollback and conflict cases
+tests/       93 tests, including tamper, fuzz, rollback and conflict cases
 legacy/      the v1 prototype, kept for reference and explicitly superseded
 ```
 
@@ -92,6 +92,28 @@ Full detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
 Email address, KDF salt and parameters, bucketed blob size, sync times, IP and
 user agent, and a day-precision modification date. **Not** entry count, titles,
 usernames, URLs, passwords, notes, TOTP seeds, or per-entry timestamps.
+
+## API docs
+
+The sync server publishes an OpenAPI schema **in development only**:
+
+```bash
+make serve                 # then open the browser
+```
+
+| URL | What |
+|---|---|
+| `http://127.0.0.1:8000/docs` | Swagger UI. Register, log in, click **Authorize**, paste the access token, and drive the API by hand |
+| `http://127.0.0.1:8000/redoc` | The same schema, laid out for reading |
+| `http://127.0.0.1:8000/openapi.json` | The raw schema, for client generators |
+
+`make openapi` writes the same schema to
+[docs/openapi.json](docs/openapi.json) without a server running — useful for
+diffing an API change in review.
+
+All three URLs are switched off when `ZKVAULT_ENVIRONMENT` is `production`,
+`prod` or `staging`: a published route map is free reconnaissance against a
+service that is otherwise supposed to give an attacker nothing.
 
 ## Deploying the server
 

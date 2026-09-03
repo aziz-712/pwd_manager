@@ -2,6 +2,7 @@
 
 import base64
 import os
+import re
 import tempfile
 
 import pytest
@@ -270,3 +271,67 @@ def test_audit_log_records_events_without_vault_material(client):
     assert {"register.ok", "login.ok", "vault.uploaded"} <= events
     dump = str(rows)
     assert "SUPER-SECRET" not in dump and AUTH_SECRET not in dump
+
+
+# --- developer documentation -----------------------------------------------
+
+
+def test_docs_are_served_with_a_csp_that_does_not_break_them(client):
+    """The API's own `default-src 'none'` blocks Swagger UI's CDN bundle, which
+    fails silently -- a 200 that renders a blank page. Pin the exemption."""
+    resp = client.get("/docs")
+    assert resp.status_code == 200
+    csp = resp.headers["Content-Security-Policy"]
+    assert "https://cdn.jsdelivr.net" in csp
+    assert "'unsafe-inline'" in csp  # FastAPI boots the bundle from an inline script
+    for asset in re.findall(r'https://[^"\']+', resp.text):
+        host = asset.split("/")[2]
+        assert host in csp, f"{asset} is loaded by /docs but not allowed by the CSP"
+    # The exemption must not leak to the API itself.
+    assert client.get("/healthz").headers["Content-Security-Policy"] == (
+        "default-src 'none'; frame-ancestors 'none'"
+    )
+
+
+def test_openapi_documents_every_route(client):
+    spec = client.get("/openapi.json").json()
+    operations = [op for ops in spec["paths"].values() for op in ops.values()]
+    assert operations
+    for op in operations:
+        assert op.get("summary"), op
+        assert op.get("tags"), op
+
+    refs, defined = set(), {f"#/components/schemas/{k}" for k in spec["components"]["schemas"]}
+
+    def walk(node):
+        if isinstance(node, dict):
+            if "$ref" in node:
+                refs.add(node["$ref"])
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(spec)
+    assert not refs - defined, "dangling $ref in the schema"
+
+
+@pytest.mark.parametrize("env", ["production", "prod", "staging"])
+def test_docs_are_not_published_outside_development(env):
+    """A route map is free reconnaissance; a deployed instance publishes none."""
+    from app.config import Settings
+    from app.openapi import app_metadata
+
+    meta = app_metadata(Settings(environment=env))
+    assert meta["docs_url"] is None
+    assert meta["redoc_url"] is None
+    assert meta["openapi_url"] is None
+
+
+def test_login_documents_both_of_its_response_shapes(client):
+    """A client has to branch on tokens vs. an MFA challenge, so both must be
+    in the schema -- not just whichever one the happy path returns."""
+    schema = client.get("/openapi.json").json()["paths"]["/api/v1/auth/login"]["post"]
+    body = str(schema["responses"]["200"])
+    assert "TokenOut" in body and "MfaRequiredOut" in body

@@ -13,8 +13,9 @@ the server has no way to compute one from the other.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Union
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from .. import audit, security
@@ -22,15 +23,19 @@ from ..config import get_settings
 from ..db import get_db
 from ..deps import auth_rate_limit, current_user
 from ..models import RefreshToken, User, _uuid
+from ..openapi import errors
 from ..schemas import (
     KdfParamsOut,
     LoginIn,
+    LogoutOut,
     MfaActivateIn,
+    MfaActivateOut,
     MfaEnrollOut,
     MfaRequiredOut,
     MfaVerifyIn,
     RefreshIn,
     RegisterIn,
+    RegisterOut,
     TokenOut,
 )
 
@@ -57,7 +62,20 @@ def _issue_tokens(db: Session, user: User, family_id: str | None = None) -> Toke
     return TokenOut(access_token=access, refresh_token=raw, expires_in=ttl)
 
 
-@router.post("/register", status_code=201, dependencies=[Depends(auth_rate_limit)])
+@router.post(
+    "/register",
+    status_code=201,
+    response_model=RegisterOut,
+    summary="Create an account",
+    description=(
+        "Takes the derived `auth_secret` and the public KDF parameters, and stores "
+        "`Argon2id(auth_secret)`. Nothing sent here can decrypt a vault."
+    ),
+    # 422 is left to FastAPI: its auto-generated body is a list of field errors,
+    # not the flat {"detail": "..."} every other failure here uses.
+    responses=errors(409, 429, describe={409: "An account with this email already exists."}),
+    dependencies=[Depends(auth_rate_limit)],
+)
 def register(body: RegisterIn, request: Request, db: Session = Depends(get_db)) -> dict[str, str]:
     email = body.email.lower()
     if db.query(User).filter(User.email == email).first():
@@ -80,8 +98,17 @@ def register(body: RegisterIn, request: Request, db: Session = Depends(get_db)) 
     return {"user_id": user.id}
 
 
-@router.get("/kdf-params", response_model=KdfParamsOut, dependencies=[Depends(auth_rate_limit)])
-def kdf_params(email: str, db: Session = Depends(get_db)) -> KdfParamsOut:
+@router.get(
+    "/kdf-params",
+    response_model=KdfParamsOut,
+    summary="Public KDF parameters for an account",
+    responses=errors(429),
+    dependencies=[Depends(auth_rate_limit)],
+)
+def kdf_params(
+    email: str = Query(description="Account email. Unknown addresses get decoy parameters, not a 404."),
+    db: Session = Depends(get_db),
+) -> KdfParamsOut:
     """Public KDF parameters for an account, so a new device can derive its keys.
 
     Unknown accounts get deterministic decoy parameters instead of a 404: the
@@ -99,7 +126,22 @@ def kdf_params(email: str, db: Session = Depends(get_db)) -> KdfParamsOut:
     )
 
 
-@router.post("/login", dependencies=[Depends(auth_rate_limit)])
+# A genuine union rather than a bare 200: the two shapes are what a client has
+# to branch on, and declaring it puts both in the schema instead of leaving the
+# MFA case undocumented.
+@router.post(
+    "/login",
+    response_model=Union[TokenOut, MfaRequiredOut],
+    summary="Exchange the derived secret for tokens",
+    description=(
+        "Returns a token pair, or -- when TOTP is enabled and no `totp_code` was "
+        "supplied -- an MFA challenge to redeem at `/auth/mfa/verify`. Unknown "
+        "accounts and wrong secrets are deliberately indistinguishable, in body "
+        "and in timing."
+    ),
+    responses=errors(401, 429, describe={401: "Unknown account, wrong secret, or wrong TOTP code."}),
+    dependencies=[Depends(auth_rate_limit)],
+)
 def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == body.email.lower()).first()
     if user is None or not user.is_active:
@@ -126,7 +168,13 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
     return _issue_tokens(db, user)
 
 
-@router.post("/mfa/verify", response_model=TokenOut, dependencies=[Depends(auth_rate_limit)])
+@router.post(
+    "/mfa/verify",
+    response_model=TokenOut,
+    summary="Redeem an MFA challenge for tokens",
+    responses=errors(401, 429, describe={401: "Expired challenge token, or wrong code."}),
+    dependencies=[Depends(auth_rate_limit)],
+)
 def mfa_verify(body: MfaVerifyIn, request: Request, db: Session = Depends(get_db)) -> TokenOut:
     claims = security.decode_token(body.mfa_token, expected_type="mfa")
     if not claims:
@@ -141,7 +189,12 @@ def mfa_verify(body: MfaVerifyIn, request: Request, db: Session = Depends(get_db
     return _issue_tokens(db, user)
 
 
-@router.post("/mfa/enroll", response_model=MfaEnrollOut)
+@router.post(
+    "/mfa/enroll",
+    response_model=MfaEnrollOut,
+    summary="Start TOTP enrolment",
+    responses=errors(401, 409, describe={409: "MFA is already enabled for this account."}),
+)
 def mfa_enroll(request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
     """Hands out a TOTP secret; it is inert until /mfa/activate proves the clock.
 
@@ -157,7 +210,12 @@ def mfa_enroll(request: Request, user: User = Depends(current_user), db: Session
     return MfaEnrollOut(secret=secret, otpauth_uri=security.totp_uri(secret, user.email))
 
 
-@router.post("/mfa/activate")
+@router.post(
+    "/mfa/activate",
+    response_model=MfaActivateOut,
+    summary="Finish TOTP enrolment",
+    responses=errors(400, 401, describe={400: "No enrolment in progress, or the code did not verify."}),
+)
 def mfa_activate(
     body: MfaActivateIn,
     request: Request,
@@ -175,7 +233,17 @@ def mfa_activate(
     return {"totp_enabled": True}
 
 
-@router.post("/refresh", response_model=TokenOut, dependencies=[Depends(auth_rate_limit)])
+@router.post(
+    "/refresh",
+    response_model=TokenOut,
+    summary="Rotate a refresh token",
+    responses=errors(
+        401,
+        429,
+        describe={401: "Unknown, expired, or already-spent token. Reuse revokes the whole family."},
+    ),
+    dependencies=[Depends(auth_rate_limit)],
+)
 def refresh(body: RefreshIn, request: Request, db: Session = Depends(get_db)) -> TokenOut:
     """Rotating refresh with reuse detection.
 
@@ -211,7 +279,12 @@ def refresh(body: RefreshIn, request: Request, db: Session = Depends(get_db)) ->
     return _issue_tokens(db, user, family_id=stored.family_id)
 
 
-@router.post("/logout")
+@router.post(
+    "/logout",
+    response_model=LogoutOut,
+    summary="Revoke every refresh token for the account",
+    responses=errors(401),
+)
 def logout(
     request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)
 ) -> dict[str, bool]:

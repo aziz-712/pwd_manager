@@ -11,6 +11,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, Response
 
 from .config import get_settings
+from .openapi import DOCS_CSP, DOCS_PATHS
 
 log = logging.getLogger("zkvault.access")
 
@@ -51,9 +52,13 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers.setdefault("Cache-Control", "no-store")
         response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
         # This API returns only JSON; a CSP this tight costs nothing and blocks
-        # the rendered-error-page class of XSS outright.
+        # the rendered-error-page class of XSS outright. The docs routes are the
+        # one exception -- they serve HTML that loads a CDN bundle -- and they
+        # only exist outside production in the first place.
+        is_docs = not settings.is_production and request.url.path in DOCS_PATHS
         response.headers.setdefault(
-            "Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'"
+            "Content-Security-Policy",
+            DOCS_CSP if is_docs else "default-src 'none'; frame-ancestors 'none'",
         )
         if settings.require_https and settings.is_production:
             response.headers.setdefault(
