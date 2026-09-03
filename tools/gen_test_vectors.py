@@ -90,6 +90,9 @@ def main() -> None:
     }
     json.dump(vectors, sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
+    auth.wipe()
+    kek.wipe()
+    master.wipe()
 
 
 if __name__ == "__main__":
